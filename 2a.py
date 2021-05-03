@@ -1,15 +1,20 @@
 import lib
-from lib import MovieLens
+from lib import MovieLens, load_dataset
 from reccomenders import *
 from preprocess import preprocess
 
-METHODS = [Random, ItemKNN, Cooccur, Popularity, SLIM]
+# METHODS = [Random, Popularity, Cooccur, SLIM, ItemKNN]
+METHODS = [Random, Popularity, Cooccur]
+
 OUTFILE = "results/2a_find_best.json"
 
 dataset = MovieLens()
 metric = lib.metrics.RecallAtK(100)
 
-train, val, test = preprocess()
+
+train = load_dataset("data/labeled/train.csv", dataset.n_movies)
+test = load_dataset("data/labeled/test.csv", dataset.n_movies)
+# train, val, test = preprocess()
 
 results = dict()
 for model in METHODS:
