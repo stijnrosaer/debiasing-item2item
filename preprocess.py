@@ -4,6 +4,8 @@ import zipfile
 import os
 import requests
 import pickle
+import scipy.sparse as sp
+from datetime import datetime
 
 ### Hyperparameters
 RATING_THRESHOLD = 3
@@ -21,6 +23,7 @@ LABELED_DATA_STORED = "data/labeled.p1"
 ML25_ZIP = "data/ml-25m.zip"
 # processed data
 RATINGS_1 = "data/processed/ratings_1.csv"
+RATINGS_COO_1 = "data/processed/ratings_coo_1.csv"
 MOVIES_1 = "data/processed/movies_1.csv"
 
 
@@ -77,9 +80,36 @@ def get_ratings_movies(base_path):
     movies = merged[merged["rating"] >= MIN_POSITIVE_RATINGS][["movieId", "title", "genres"]]
     movies["year"] = movies["title"].str.extract(r'\((\d{4})\)').fillna("-1").astype(int)
 
+
+
     ratings = ratings[ratings["movieId"].isin(movies["movieId"])].dropna()
 
+    i = ratings["movieId"].values
+    j = ratings["userId"].values
+
+    ratings_coo = sp.coo_matrix((ratings["rating"].values, (i, j))).transpose()
+
+    remaining_movie_ids = np.unique(ratings_coo.col)
+    new_ids = -np.ones(ratings_coo.shape[1], dtype=int)
+    new_ids[remaining_movie_ids] = np.arange(remaining_movie_ids.size)
+
+    ratings_coo.col = new_ids[ratings_coo.col]
+
+    movies["newId"] = new_ids[movies.movieId]
+
+    t = ratings.groupby("movieId").min()["timestamp"].reset_index()
+
+    def convert(row):
+        return datetime.fromtimestamp(row).year
+
+    t["timestamp"] = t["timestamp"].apply(convert)
+
+    print(t.head())
+    movies["year_first"] = movies["movieId"].map(t.set_index("movieId")["timestamp"])
+
+
     ratings.drop(["timestamp"], axis="columns", inplace=True)
+    ratings_coo = ratings_coo.tocoo()
 
     if VERBOSE >= 1:
         print(ratings.head())
@@ -87,7 +117,13 @@ def get_ratings_movies(base_path):
 
     print(f"{len(ratings)} remaining ratings")
     print(f"{len(movies)} remaining movies")
-    print(f"{len(ratings['userId'].unique())} remaining unique users")
+    print(f"{len(ratings['userId'].unique())} remaining users")
+
+    ratings_data = np.hstack((ratings_coo.row.reshape(-1, 1), ratings_coo.col.reshape(-1, 1),
+                        ratings_coo.data.reshape(-1, 1)))
+
+    np.savetxt(RATINGS_COO_1, ratings_data, fmt="%d", delimiter=",")
+
     return ratings, movies
 
 
@@ -146,12 +182,14 @@ def split_relevant_judgements(labeled, ratings, movies):
     print("test size:", result["test"]["movieId"].nunique())
     return result["train"], result["val"], result["test"]
 
+
 def preprocess():
     labeled = load_labeled_dataset()
     ratings, movies = load_movielens()
 
     # returns train, val, test
     return split_relevant_judgements(labeled, ratings, movies)
+
 
 if __name__ == '__main__':
     preprocess()
