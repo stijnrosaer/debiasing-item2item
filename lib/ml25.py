@@ -45,36 +45,106 @@ def read_movielens_ratings(movielens_file):
 
 class MovieLens(object):
     def __init__(self):
-        movies = pd.read_csv("data/processed/movies_1.csv", index_col="movieId")
-        ratings = pd.read_csv("data/processed/ratings_1.csv")
+        movies = pd.read_csv("data/processed/movies_1.csv", index_col="newId")
+        ratings = pd.read_csv("data/processed/ratings_coo_1.csv", names=["userId", "movieId", "rating"], header=None)
 
         i = ratings["userId"].values
         j = ratings["movieId"].values
         data = (ratings["rating"]).astype(int)
 
-        popularity = ratings[["movieId", "rating"]].groupby("movieId").sum().reset_index()
-        popularity.rename(columns={"rating": "popularity"}, inplace=True)
-        popularity["log_popularity"] = np.log(popularity["popularity"])
-        popularity["popularity_rank"] = popularity["popularity"].rank(method="first", ascending=False)
+        ratings = sp.coo_matrix((data, (i, j))).tocsc()
 
-        movies = pd.merge(movies, popularity, left_on="movieId", right_on="movieId")
 
-        # movies["normalized_popularity"] = movies["popularity"]/movies["year"].max() + 1 - movies["year"]
+        newId_lut = -np.ones(movies.movieId.max() + 2, dtype=int)
+        newId_lut[movies.movieId.values] = movies.index.values
 
-        self.movies = movies
-        self.n_movies = movies["movieId"].nunique()
-        self.movie_list = np.asarray(movies["movieId"].unique())
+        popularity = np.asarray(ratings.sum(axis=0)).flatten()
+        index = np.arange(len(popularity), dtype=int)
+        movies.loc[index, "popularity"] = popularity
+        movies["normalized_popularity"] = (
+                movies["popularity"] / (movies["year"].max() + 1 - movies["year"]))
+        movies["popularity_rank"] = movies["popularity"].rank(method="first", ascending=False)
+        movies["popularity_log"] = np.log(movies["popularity"])
         self.ratings = ratings
+        self.newIdLookupTable = newId_lut
+        self._tags = "NOT_INITIALIZED"
+        self.items = movies
+        self.ratings_file = movies
+        self.f_tags = movies
+        self.n_items = ratings.shape[1]
+        self.n_users = ratings.shape[0]
 
-        self.ratings_converted = ratings.groupby("userId")["movieId"].apply(list).reset_index()
-        self.ratings_converted.columns = ["userId", "movieIds"]
-
+        # popularity = ratings[["movieId", "rating"]].groupby("movieId").sum().reset_index()
+        # popularity.rename(columns={"rating": "popularity"}, inplace=True)
+        # popularity["log_popularity"] = np.log(popularity["popularity"])
+        # popularity["popularity_rank"] = popularity["popularity"].rank(method="first", ascending=False)
+        #
+        # movies = pd.merge(movies, popularity, left_on="movieId", right_on="movieId")
+        #
+        # # movies["normalized_popularity"] = movies["popularity"]/movies["year"].max() + 1 - movies["year"]
+        #
+        # self.movies = movies
+        # self.n_movies = movies["movieId"].nunique()
+        # self.movie_list = np.asarray(movies["movieId"].unique())
+        # self.ratings = ratings
+        #
+        # # self.ratings_converted = ratings.groupby("userId")["movieId"].apply(list).reset_index()
+        # # self.ratings_converted.columns = ["userId", "movieIds"]
+        #
         # self.ratings_converted_2 = ratings.groupby("movieId")["userId"].apply(list).reset_index()
         # self.ratings_converted_2.columns = ["movieId", "userIds"]
 
     def get_popularity(self, movie_id):
-        return np.asarray(self.movies[self.movies.movieId == movie_id]["popularity"]).astype(np.float32)
+        # return np.asarray(self.movies[self.movies.movieId == movie_id]["popularity"]).astype(np.float32)
+        return self.items.loc[movie_id, "popularity"].apply(float)
 
+    def ml_id_to_internal_id(self, ml_ids):
+        return np.take(self.newIdLookupTable, ml_ids, mode='clip')
+
+    def load_dataset(self, file_name):
+        # dataset = pd.read_csv(file_name)
+        #
+        # true_labels = pd.DataFrame(columns=["movieId", "labels"])
+        # for name, group in dataset.groupby("movieId"):
+        #     labels = group[group["sim_bin"] == 1]["neighborId"].tolist()
+        #
+        #     true_labels = true_labels.append({"movieId": name, "labels": labels}, ignore_index=True)
+        #
+        # return {"groups": true_labels}
+
+        rankings = pd.read_csv(file_name)
+
+        rankings["a_iid"] = self.ml_id_to_internal_id(rankings["movieId"].values)
+        rankings["b_iid"] = self.ml_id_to_internal_id(rankings["neighborId"].values)
+
+        valid_rankings = rankings[(rankings.a_iid > -1) & (rankings.b_iid > -1)]
+
+        info = collections.OrderedDict()
+        info["# rankings"] = rankings["movieId"].nunique()
+        info["# invalid rankings"] = (rankings.groupby(by="movieId").max()["a_iid"] == -1).sum()
+        info["# invalid results"] = (rankings["b_iid"] == -1).sum()
+        per_ranking = valid_rankings.groupby(by="a_iid").count()["b_iid"]
+        labels_per_ranking = valid_rankings.groupby(by="a_iid").sum()["sim_bin"]
+        info["Length of each ranking"] = ("%.2f (min=%d, max=%d))" % (
+            per_ranking.mean(), per_ranking.min(), per_ranking.max()))
+        info["Pos labels in each ranking"] = ("%.2f (min=%d, max=%d))" % (
+            labels_per_ranking.mean(), labels_per_ranking.min(), labels_per_ranking.max()))
+
+        print(info)
+
+        df = pd.DataFrame({"a_iid": valid_rankings["a_iid"], "a_ml_id": valid_rankings["movieId"],
+                           "b_iid": valid_rankings["b_iid"], "b_ml_id": valid_rankings["neighborId"],
+                           "label": valid_rankings["sim_bin"]})
+
+        As, Bs = list(), list()
+        for name, group in df.groupby("a_iid"):
+            labels = np.zeros(self.n_items)
+            labels[group["b_iid"].values.flatten()] = group["label"].values.flatten()
+            As.append(name)
+            Bs.append(labels)
+        groups = pd.DataFrame({"a_iid": As, "labels": Bs})
+
+        return {"rows": df, "groups": groups}
 
 def read_movie_titles(file):
     if "100k" in file:
@@ -112,53 +182,7 @@ def extract_timestamp_features(timestamps, remaining_movie_ids):
     return pd.DataFrame(results).set_index("movieId")
 
 
-def convert_to_implicit(version, rating_threshold=3.0, min_freq=30):
-    f_ratings, f_titles, f_tags = ml(version)
-    ratings, timestamps = read_movielens_ratings(f_ratings)
-    titles = read_movie_titles(f_titles)
 
-    print("Loaded %d entries from %d users with %d movies" %
-          (ratings.nnz, ratings.shape[0], ratings.shape[1]))
-    print("Movie title database: %d entries" % len(titles))
-    ratings.data = (ratings.data >= rating_threshold).astype(int)
-    popularity = (ratings.sum(0) >= min_freq)  # movie popularity
-    ratings = ratings.multiply(popularity)
-    timestamps = timestamps.multiply(ratings)
-
-    timestamps.eliminate_zeros()
-    ratings.eliminate_zeros()
-
-    remaining_movie_ids = np.unique(ratings.col)
-    new_ids = -np.ones(ratings.shape[1], dtype=int)
-    new_ids[remaining_movie_ids] = np.arange(remaining_movie_ids.size)
-
-    ratings.col = new_ids[ratings.col]
-    print("After thresholding: %d entries, %d movies remain" %
-          (ratings.nnz, len(remaining_movie_ids)))
-    path = "/".join(f_ratings.split("/")[:-1]) + "-implicit/"
-    Path(path).mkdir(parents=True, exist_ok=True)
-
-    ratings = ratings.tocoo()
-    all = np.hstack((ratings.row.reshape(-1, 1), ratings.col.reshape(-1, 1),
-                     ratings.data.reshape(-1, 1)))
-    np.savez_compressed(path + "ratings.npz", ratings=all)
-    np.savetxt(path + "ratings.csv", all, fmt="%d", delimiter=",")
-
-    titles["newId"] = new_ids[titles.movieId]
-    titles["year"] = titles["title"].str.extract(r'\((\d{4})\)').fillna("-1").astype(int)
-    titles.to_csv(path + "movies.csv", index=False)
-
-
-def load_dataset(file_name, n_movies):
-    dataset = pd.read_csv(file_name)
-
-    true_labels = pd.DataFrame(columns=["movieId", "labels"])
-    for name, group in dataset.groupby("movieId"):
-        labels = group[group["sim_bin"] == 1]["neighborId"].tolist()
-
-        true_labels = true_labels.append({"movieId": name, "labels": labels}, ignore_index=True)
-
-    return {"groups": true_labels}
 
 
 if __name__ == "__main__":
@@ -170,4 +194,4 @@ if __name__ == "__main__":
     parser.add_argument("--min_count", type=int, default=30,
                         help="movies with < min_count positive ratings will be removed")
     args = parser.parse_args()
-    convert_to_implicit(args.movielens_version, args.min_rating, args.min_count)
+    # convert_to_implicit(args.movielens_version, args.min_rating, args.min_count)
